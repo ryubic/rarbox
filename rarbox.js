@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { parseArgs, styleText } from "node:util";
 import { RAR_BINARY_PATH, OUTPUT_DIR, RAR_SWITCHES } from "./config.js";
@@ -93,14 +93,13 @@ Examples:
         .readdirSync(sourceDir, { withFileTypes: true })
         .filter((entry) => entry.isDirectory()) // keep only directories
         .map((entry) => path.join(sourceDir, entry.name)) // extract absolute paths
-        .sort((a, b) => a.localeCompare(b)) // sort alphabetically (case-insensitive safe)
     : [sourceDir];
 
   if (dirsToRar.length === 0) throw new Error("No folders to archive");
 
   const outputDir = path.join(
     path.resolve(OUTPUT_DIR),
-    `${path.basename(sourceDir)}-${randomBytes(4).toString("hex")}`,
+    `${path.basename(sourceDir)}-${randomUUID().slice(0, 13)}`,
   );
 
   // ask user if they want to proceed, return early if they don't
@@ -172,14 +171,29 @@ Examples:
     let reason;
 
     if (success) {
+      const movedFiles = [];
       try {
         // move archives to output directory
         for (const file of fs.readdirSync(tempDir)) {
-          fs.renameSync(path.join(tempDir, file), path.join(outputDir, file));
+          const source = path.join(tempDir, file);
+          const destination = path.join(outputDir, file);
+
+          fs.renameSync(source, destination);
+          movedFiles.push(destination);
         }
       } catch (error) {
         success = false;
         reason = `Failed to move archive into place: ${error.message}`;
+
+        for (const file of movedFiles) {
+          try {
+            fs.rmSync(file, { force: true });
+          } catch (cleanupError) {
+            console.error(
+              `Failed to remove partially moved archive ${file}: ${cleanupError.message}`,
+            );
+          }
+        }
       }
     } else {
       reason =
@@ -214,7 +228,7 @@ main()
     const { dirsToRar, done, failed } = result;
     if (dirsToRar.length === done.length) {
       console.log(styleText("green", "\n--- All Done! ---"));
-      process.exit(0);
+      process.exitCode = 0;
     } else {
       console.error(
         styleText(
@@ -223,11 +237,11 @@ main()
         ),
       );
       failed.forEach((dir, index) => console.error(`    ${index + 1}. ${dir}`));
-      process.exit(1);
+      process.exitCode = 1;
     }
   })
   .catch((err) => {
     console.error(err.message);
     if (err.cause) console.error("Caused by:", err.cause.message ?? err.cause);
-    process.exit(1);
+    process.exitCode = 1;
   });
