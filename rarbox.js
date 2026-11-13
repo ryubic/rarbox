@@ -1,94 +1,72 @@
+#!/usr/bin/env node
+
+const RAR_BINARY_PATH =
+  process.platform === "win32" ? "C:\\Program Files\\WinRAR\\Rar.exe" : "rar";
+
+const RAR_SWITCHES = [
+  "-cfg-", // ignore rar.ini / RARINISWITCHES so ONLY these settings apply
+  "-r", // recurse into subdirectories to ensure present into the target folder gets added into the archive
+  "-idq", // run rar in quiet mode, so only error messages and questions are displayed
+  "-m0", // Store (no compression)
+  "-v2000m", // volumes of 2000 MB. Lowercase m = 1024*1024 bytes (2000 MiB), uppercase M would be 1,000,000 bytes (2,000,000,000 total)
+  "-rr10", // recovery record, 10% of archive size (RAR5: value is a percent)
+  "-htb", // BLAKE2sp file checksums instead of CRC32
+  "-ams", // store original archive name and creation time
+  "-tsm+", // store modification time, maximum precision
+  "-tsc+", // store creation time (ctime on Unix), maximum precision
+  "-k", // lock archive (protects against accidental modification by RAR only)
+  "-t", // test files after archiving
+];
+
+const RAR_ERRORS = {
+  1: "Non-fatal error(s) occurred.",
+  2: "A fatal error occurred.",
+  3: "Invalid checksum. Data is damaged.",
+  4: "Attempt to modify an archive locked by 'k' command.",
+  5: "Write error.",
+  6: "File open error.",
+  7: "Wrong command line option.",
+  8: "Not enough memory.",
+  9: "File create error.",
+  10: "No files matching the specified mask and options were found.",
+  11: "Wrong password.",
+  12: "Read error.",
+  13: "Bad archive.",
+  255: "User stopped the process.",
+};
+
 import fs from "node:fs";
 import path from "node:path";
-import readline from "node:readline/promises";
-import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { parseArgs, styleText } from "node:util";
-import { RAR_BINARY_PATH, OUTPUT_DIR, RAR_SWITCHES } from "./config.js";
+import { styleText } from "node:util";
+import readline from "node:readline/promises";
 
 async function main() {
+  // print banner
   const banner = `┬─┐┌─┐┬─┐┌┐ ┌─┐─┐ ┬                
 ├┬┘├─┤├┬┘├┴┐│ │┌┴┬┘
 ┴└─┴ ┴┴└─└─┘└─┘┴ └─
 `;
-  console.log(styleText("magenta", banner));
+  console.log(banner);
 
   // parse args
-  let args;
-  try {
-    args = parseArgs({
-      allowPositionals: true,
-      options: {
-        help: { type: "boolean", short: "h", default: false },
-        "subfolder-mode": { type: "boolean", short: "f", default: false },
-      },
-    });
-  } catch (error) {
-    throw new Error("Failed to parse arguments", { cause: error });
-  }
+  const args = process.argv.slice(2);
+  const subfolderMode = args.includes("-f");
+  const targetPath = args.find((arg) => !arg.startsWith("-")) || ".";
 
-  if (args.values.help) {
-    console.log(`Usage:
-  node rarbox.js [options] <directory>
+  const sourceDir = path.resolve(targetPath);
 
-Arguments:
-  <directory>             Source directory (must not be a drive root and must
-                          not contain the output directory)
+  if (!fs.existsSync(sourceDir) || !fs.statSync(sourceDir).isDirectory())
+    throw new Error("Please provide path of a valid folder to archive");
 
-Options:
-  -f, --subfolder-mode    Archive each immediate subfolder of <directory> as its
-                          own archive, instead of archiving <directory> itself.
-                          Files directly inside <directory> are not archived.
-  -h, --help              Show this help and exit
-
-Examples:
-  node rarbox.js D:\\Photos\\2024   Archive the 2024 folder as one archive
-  node rarbox.js -f D:\\Photos     Archive each subfolder of Photos separately`);
-
-    return;
-  }
-
-  // check if rar is available
-  const checkRar = spawnSync(RAR_BINARY_PATH, ["-iver"]);
-
-  if (checkRar.status !== 0 || checkRar.error?.code === "ENOENT")
+  if (!subfolderMode && path.parse(sourceDir).root === sourceDir)
     throw new Error(
-      `Could not run RAR at "${RAR_BINARY_PATH}". Check RAR_BINARY_PATH in config.js.`,
-      { cause: checkRar.error },
+      "Refusing to archive a drive root as a single archive. Use -f to archive its subfolders.",
     );
 
-  if (args.positionals.length !== 1)
-    throw new Error("Please enter only options and a single directory path");
+  const runRarIn = subfolderMode ? sourceDir : path.dirname(sourceDir);
 
-  const sourceDir = path.resolve(args.positionals[0]);
-
-  // check if provided source directory is valid
-  let sourceDirStat;
-  try {
-    sourceDirStat = fs.statSync(sourceDir);
-  } catch (error) {
-    throw new Error("Source directory path is invalid", { cause: error });
-  }
-
-  if (!sourceDirStat.isDirectory())
-    throw new Error("Source directory is not a directory");
-
-  if (path.parse(sourceDir).root === sourceDir)
-    throw new Error("Source directory must not be a drive root");
-
-  // check if OUTPUT_DIR is in sourceDir
-  const rel = path.relative(sourceDir, OUTPUT_DIR);
-  if (
-    rel === "" ||
-    (rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel))
-  )
-    throw new Error("OUTPUT_DIR should not be or be inside source directory");
-
-  const runRarIn = args.values["subfolder-mode"]
-    ? sourceDir
-    : path.dirname(sourceDir);
-
-  const dirsToRar = args.values["subfolder-mode"]
+  const dirsToRar = subfolderMode
     ? fs
         .readdirSync(sourceDir, { withFileTypes: true })
         .filter((entry) => entry.isDirectory()) // keep only directories
@@ -97,15 +75,20 @@ Examples:
 
   if (dirsToRar.length === 0) throw new Error("No folders to archive");
 
-  const outputDir = path.join(
-    path.resolve(OUTPUT_DIR),
-    `${path.basename(sourceDir)}-${randomUUID().slice(0, 13)}`,
-  );
+  // check if rar exists
+  const rarCheck = spawnSync(RAR_BINARY_PATH, ["-iver"]);
+  if (rarCheck.error?.code === "ENOENT")
+    throw new Error(
+      `RAR not found at "${RAR_BINARY_PATH}". On Windows, install WinRAR. On Linux/macOS, install the RAR CLI tools and make sure they're on your PATH.`,
+    );
 
-  // ask user if they want to proceed, return early if they don't
+  // Summary
   console.log(`Source directory         : ${sourceDir}`);
-  console.log(`Save archives in         : ${outputDir}`);
-  console.log(`Subfolders mode          : ${args.values["subfolder-mode"]}`);
+  console.log(`Save archives in         : ${runRarIn}`);
+  const modeLabel = subfolderMode
+    ? styleText("green", "ON (one archive per subfolder)")
+    : styleText("yellow", "OFF (one archive for the whole folder)");
+  console.log(`Subfolders mode          : ${modeLabel}`);
   console.log(`RAR switches             : ${RAR_SWITCHES.join(" ")}`);
   console.log(`Directories to archive   : ${dirsToRar.length}`);
   dirsToRar.forEach((dir, index) => console.log(`    ${index + 1}. ${dir}`));
@@ -116,132 +99,75 @@ Examples:
     output: process.stdout,
   });
 
-  const userResponse = await rl.question(`\nProceed? (y/n): `);
+  const userResponse = await rl.question(`\nProceed? (y/N): `);
   rl.close();
 
   if (userResponse.trim().toLowerCase() !== "y") {
-    console.log("\nCancelled. No archives were created.");
+    console.log("Cancelled. Nothing was archived.");
     return;
-  } else console.log("\nCreating archives...");
-
-  // create output directory recursively
-  try {
-    fs.mkdirSync(outputDir, { recursive: true });
-  } catch (error) {
-    throw new Error(`Failed to create ${outputDir}`, { cause: error });
   }
 
   // start archiving
-  const done = [];
-  const failed = [];
+  let passed = 0;
+  let failed = 0;
 
-  for (const dir of dirsToRar) {
-    const tempDir = path.join(
-      path.resolve(OUTPUT_DIR),
-      ".rarbox-temp",
-      randomUUID(),
-    );
-
-    // create temp directory recursively
-    try {
-      fs.mkdirSync(tempDir, { recursive: true });
-    } catch (error) {
-      console.error(
-        `[FAILURE] ${dir}\nFailed to create ${tempDir}: ${error.message}\n`,
-      );
-      failed.push(dir);
-      continue;
-    }
-
-    const archive = path.join(tempDir, `${path.basename(dir)}.rar`);
-
-    const runRar = spawnSync(
+  for (const [index, dir] of dirsToRar.entries()) {
+    const result = spawnSync(
       RAR_BINARY_PATH,
       [
         "a",
         ...RAR_SWITCHES,
         "--", // stop switches scanning
-        archive,
+        `${path.basename(dir)}.rar`,
         path.relative(runRarIn, dir),
       ],
-      { cwd: runRarIn, stdio: "inherit" },
+      { cwd: runRarIn, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 },
     );
 
-    let success = !runRar.error && runRar.status === 0;
-    let reason;
+    if (result.status === 0) {
+      passed++;
 
-    if (success) {
-      const movedFiles = [];
-      try {
-        // move archives to output directory
-        for (const file of fs.readdirSync(tempDir)) {
-          const source = path.join(tempDir, file);
-          const destination = path.join(outputDir, file);
-
-          fs.renameSync(source, destination);
-          movedFiles.push(destination);
-        }
-      } catch (error) {
-        success = false;
-        reason = `Failed to move archive into place: ${error.message}`;
-
-        for (const file of movedFiles) {
-          try {
-            fs.rmSync(file, { force: true });
-          } catch (cleanupError) {
-            console.error(
-              `Failed to remove partially moved archive ${file}: ${cleanupError.message}`,
-            );
-          }
-        }
-      }
+      console.log(
+        styleText(
+          "green",
+          `[${index + 1}/${dirsToRar.length}] [+] Successfully archived ${dir}`,
+        ),
+      );
     } else {
-      reason =
-        runRar.error?.message ??
-        (runRar.signal
-          ? `RAR was terminated by signal ${runRar.signal}`
-          : `RAR exited with code ${runRar.status}`);
-    }
+      console.log(
+        styleText(
+          "red",
+          `[${index + 1}/${dirsToRar.length}] [-] Failed to archive ${dir}`,
+        ),
+      );
 
-    if (success) {
-      console.log(styleText("green", `[+] ${dir}`));
-      done.push(dir);
-    } else {
-      console.error(styleText("red", `[-] ${dir}\n${reason}`));
-      failed.push(dir);
-    }
+      let reason = "Unknown error";
+      if (result.error) reason = result.error.message;
+      else if (result.signal) reason = `Terminated by signal ${result.signal}`;
+      else if (result.status !== null)
+        reason = `exit code (${result.status}) - ${RAR_ERRORS[result.status] ?? "Unknown error"}`;
 
-    // delete temp directory
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch (error) {
-      console.error(`Failed to remove temp directory: ${error.message}`);
+      console.log(`${styleText("red", "reason :")} ${reason}`);
+
+      const stdout = result.stdout?.trim();
+      const stderr = result.stderr?.trim();
+      if (stdout) console.log(`${styleText("red", "stdout :")} ${stdout}`);
+      if (stderr) console.log(`${styleText("red", "stderr :")} ${stderr}`);
+
+      failed++;
     }
   }
 
-  return { dirsToRar, done, failed };
+  console.log(`========================================`);
+  const color = failed > 0 ? "red" : "green";
+  console.log(
+    styleText(color, `Complete! Success: ${passed} | Failed: ${failed}`),
+  );
+
+  process.exitCode = failed > 0 ? 1 : 0;
 }
 
-main()
-  .then((result) => {
-    if (!result) return;
-    const { dirsToRar, done, failed } = result;
-    if (dirsToRar.length === done.length) {
-      console.log(styleText("green", "\n--- All Done! ---"));
-      process.exitCode = 0;
-    } else {
-      console.error(
-        styleText(
-          "red",
-          `\n--- Failed to create ${failed.length}/${dirsToRar.length} archives ---`,
-        ),
-      );
-      failed.forEach((dir, index) => console.error(`    ${index + 1}. ${dir}`));
-      process.exitCode = 1;
-    }
-  })
-  .catch((err) => {
-    console.error(err.message);
-    if (err.cause) console.error("Caused by:", err.cause.message ?? err.cause);
-    process.exitCode = 1;
-  });
+main().catch((err) => {
+  console.error(err.message);
+  process.exitCode = 1;
+});
